@@ -1,0 +1,140 @@
+import serial
+import time
+from datetime import datetime
+
+class SerialCommandDriver:
+    def __init__(self, port='COM5', baudrate=9600, timeout=1):
+        self.port = port
+        self.baudrate = baudrate
+        self.timeout = timeout
+        self.ser = None
+        self.log_file = None
+        self.log_file_handle = None
+
+    def update_log_file(self, cycle_number):
+        date_str = datetime.now().strftime("%Y-%m-%d")
+        self.log_file = f"log_{date_str}_cycle_{cycle_number:03d}.txt"
+        if self.log_file_handle:
+            self.log_file_handle.close()
+        self.log_file_handle = open(self.log_file, 'w')
+
+    def log(self, message):
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        log_message = f"[{timestamp}] {message}"
+        print(log_message)
+        if self.log_file_handle:
+            self.log_file_handle.write(log_message + '\n')
+
+    def open_connection(self):
+        try:
+            self.ser = serial.Serial(self.port, self.baudrate, timeout=self.timeout)
+            self.log(f"Connected to {self.port} at {self.baudrate} baud rate.")
+        except Exception as e:
+            self.log(f"Error opening connection: {e}")
+
+    def close_connection(self):
+        if self.ser and self.ser.is_open:
+            self.ser.close()
+            self.log(f"Connection to {self.port} closed.")
+        else:
+            self.log(f"No active connection to {self.port}.")
+        if self.log_file_handle:
+            self.log_file_handle.close()
+
+    def send_command(self, command):
+        if self.ser and self.ser.is_open:
+            self.ser.write(command.encode('utf-8'))
+            self.log(f"Command sent: {command.strip()}")
+        else:
+            self.log("No active connection to send command.")
+
+    def sanitize_response(self, response):
+        return ''.join([char for char in response if char.isprintable()])
+
+    def receive_response(self, timeout_seconds, delay_seconds=10):
+        if self.ser and self.ser.is_open:
+            start_time = time.time()
+            while time.time() - start_time < timeout_seconds:
+                response = self.ser.readline().decode('utf-8').strip()
+                sanitized = self.sanitize_response(response)
+                if sanitized == "NO" or not sanitized:
+                    time.sleep(delay_seconds)
+                    continue
+                self.log(f"Received: '{sanitized}'")
+                return sanitized
+            self.log(f"Timeout reached after {timeout_seconds} seconds.")
+            return None
+        else:
+            self.log("No active connection to receive response.")
+            return None
+
+    def is_error(self, response):
+        error_responses = ['STATUS_WRONG_TUBE', 'DECAP_ERR', 'RECAP_ERR', 'BNO', 'CNO']
+        if response in error_responses:
+            self.log(f"Error received: '{response}'. Stopping the loop.")
+            return True
+        return False
+
+
+if __name__ == "__main__":
+    driver = SerialCommandDriver(port='COM5', baudrate=9600)
+    driver.open_connection()
+
+    cycle_counter = 0
+
+    while True:
+        cycle_counter += 1
+        driver.update_log_file(cycle_counter)
+        driver.log(f"\n--- Starting cycle {cycle_counter} ---")
+
+        # Step 1: Send 'B'
+        driver.send_command("B\n")
+        response = driver.receive_response(timeout_seconds=60, delay_seconds=10)
+
+        if response == "BOK":
+            driver.log("Received 'BOK'. Now waiting for the next response...")
+
+            # Step 2: Wait for DECAP_OK or error
+            decap_response = driver.receive_response(timeout_seconds=120, delay_seconds=10)
+
+            if decap_response == "DECAP_OK":
+                driver.log("Received 'DECAP_OK'. Now sending 'C'...")
+
+                # Step 3: Send 'C'
+                driver.send_command("C\n")
+                cok_response = driver.receive_response(timeout_seconds=60, delay_seconds=10)
+
+                if cok_response == "COK":
+                    driver.log("Received 'COK'. Now waiting for 'RECAP_OK'...")
+
+                    # Step 4: Wait for RECAP_OK or error
+                    recap_response = driver.receive_response(timeout_seconds=120, delay_seconds=10)
+
+                    if recap_response == "RECAP_OK":
+                        driver.log("Received 'RECAP_OK'. Cycle complete.")
+                        time.sleep(1)
+                        continue
+                    else:
+                        if driver.is_error(recap_response):
+                            break
+                        driver.log("Did not receive 'RECAP_OK'. Stopping the loop.")
+                        break
+                else:
+                    if driver.is_error(cok_response):
+                        break
+                    driver.log("Did not receive 'COK'. Stopping the loop.")
+                    break
+
+            else:
+                if driver.is_error(decap_response):
+                    break
+                driver.log("Did not receive 'DECAP_OK'. Stopping the loop.")
+                break
+
+        else:
+            if driver.is_error(response):
+                break
+            driver.log("Did not receive 'BOK'. Stopping the loop.")
+            break
+
+    driver.close_connection()

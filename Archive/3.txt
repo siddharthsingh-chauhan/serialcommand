@@ -1,0 +1,120 @@
+import serial
+import time
+
+class SerialCommandDriver:
+    def __init__(self, port='COM5', baudrate=9600, timeout=1):
+        self.port = port
+        self.baudrate = baudrate
+        self.timeout = timeout
+        self.ser = None
+
+    def open_connection(self):
+        try:
+            self.ser = serial.Serial(self.port, self.baudrate, timeout=self.timeout)
+            print(f"Connected to {self.port} at {self.baudrate} baud rate.")
+        except Exception as e:
+            print(f"Error opening connection: {e}")
+
+    def close_connection(self):
+        if self.ser and self.ser.is_open:
+            self.ser.close()
+            print(f"Connection to {self.port} closed.")
+        else:
+            print(f"No active connection to {self.port}.")
+
+    def send_command(self, command):
+        if self.ser and self.ser.is_open:
+            self.ser.write(command.encode('utf-8'))
+            print(f"Command sent: {command.strip()}")
+        else:
+            print("No active connection to send command.")
+
+    def sanitize_response(self, response):
+        return ''.join([char for char in response if char.isprintable()])
+
+    def receive_response(self, timeout_seconds, delay_seconds=10):
+        if self.ser and self.ser.is_open:
+            start_time = time.time()
+            while time.time() - start_time < timeout_seconds:
+                response = self.ser.readline().decode('utf-8').strip()
+                sanitized = self.sanitize_response(response)
+                if sanitized == "NO" or not sanitized:
+                    time.sleep(delay_seconds)
+                    continue
+                print(f"Received: '{sanitized}'")
+                return sanitized
+            print(f"Timeout reached after {timeout_seconds} seconds.")
+            return None
+        else:
+            print("No active connection to receive response.")
+            return None
+
+    def is_error(self, response):
+        error_responses = ['STATUS_WRONG_TUBE', 'DECAP_ERR', 'RECAP_ERR', 'BNO', 'CNO']
+        if response in error_responses:
+            print(f"Error received: '{response}'. Stopping the loop.")
+            return True
+        return False
+
+
+if __name__ == "__main__":
+    driver = SerialCommandDriver(port='COM5', baudrate=9600)
+    driver.open_connection()
+
+    cycle_counter = 0
+
+    while True:
+        cycle_counter += 1
+        print(f"\nStarting cycle {cycle_counter}...\n")
+
+        # Step 1: Send 'B'
+        driver.send_command("B\n")
+        response = driver.receive_response(timeout_seconds=60, delay_seconds=10)
+
+        if response == "BOK":
+            print("Received 'BOK'. Now waiting for the next response...")
+
+            # Step 2: Wait for DECAP_OK or error
+            decap_response = driver.receive_response(timeout_seconds=120, delay_seconds=10)
+
+            if decap_response == "DECAP_OK":
+                print("Received 'DECAP_OK'. Now sending 'C'...")
+
+                # Step 3: Send 'C'
+                driver.send_command("C\n")
+                cok_response = driver.receive_response(timeout_seconds=60, delay_seconds=10)
+
+                if cok_response == "COK":
+                    print("Received 'COK'. Now waiting for 'RECAP_OK'...")
+
+                    # Step 4: Wait for RECAP_OK or error
+                    recap_response = driver.receive_response(timeout_seconds=120, delay_seconds=10)
+
+                    if recap_response == "RECAP_OK":
+                        print("Received 'RECAP_OK'. Cycle complete.\n")
+                        time.sleep(1)
+                        continue
+                    else:
+                        if driver.is_error(recap_response):
+                            break
+                        print("Did not receive 'RECAP_OK'. Stopping the loop.")
+                        break
+                else:
+                    if driver.is_error(cok_response):
+                        break
+                    print("Did not receive 'COK'. Stopping the loop.")
+                    break
+
+            else:
+                if driver.is_error(decap_response):
+                    break
+                print("Did not receive 'DECAP_OK'. Stopping the loop.")
+                break
+
+        else:
+            if driver.is_error(response):
+                break
+            print("Did not receive 'BOK'. Stopping the loop.")
+            break
+
+    driver.close_connection()

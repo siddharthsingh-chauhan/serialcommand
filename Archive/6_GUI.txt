@@ -1,0 +1,265 @@
+import tkinter as tk
+from tkinter import ttk, scrolledtext, messagebox
+import serial
+import serial.tools.list_ports
+import threading
+import time
+from datetime import datetime
+from ttkbootstrap import Style
+from tkinter import PhotoImage  # Import PhotoImage
+
+class SerialCommandDriver:
+    def __init__(self, log_callback, port='COM5', baudrate=9600, timeout=1):
+        self.port = port
+        self.baudrate = baudrate
+        self.timeout = timeout
+        self.ser = None
+        self.cycle_counter = 0
+        self.log_callback = log_callback
+        self.log_file = None
+        self.running = False
+
+    def create_log_file(self):
+        start_time = datetime.now()
+        timestamp = start_time.strftime("%Y%m%d_%H%M%S")
+        filename = f"log_{timestamp}.txt"
+        self.log_file = open(filename, "a", encoding="utf-8")
+        self.log(f"Log started at {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+
+    def log(self, message):
+        timestamp = datetime.now().strftime("[%Y-%m-%d %H:%M:%S]")
+        log_entry = f"{timestamp} {message}"
+        self.log_callback(log_entry)
+        if self.log_file and not self.log_file.closed:
+            self.log_file.write(log_entry + "\n")
+
+    def finalize_log(self):
+        self.log("")
+        self.log("--- Process Summary ---")
+        self.log(f"Total cycles completed: {self.cycle_counter}")
+        if self.log_file and not self.log_file.closed:
+            self.log_file.close()
+
+    def open_connection(self):
+        try:
+            self.ser = serial.Serial(self.port, self.baudrate, timeout=self.timeout)
+            self.log(f"Connected to {self.port} at {self.baudrate} baud rate.")
+        except Exception as e:
+            self.log(f"Error opening connection: {e}")
+
+    def close_connection(self):
+        if self.ser and self.ser.is_open:
+            self.ser.close()
+        self.log(f"Connection to {self.port} closed.")
+
+    def send_command(self, command):
+        if self.ser and self.ser.is_open:
+            self.ser.write(command.encode('utf-8'))
+            self.log(f"Command sent: {command.strip()}")
+
+    def sanitize_response(self, response):
+        return ''.join([char for char in response if char.isprintable()])
+
+    def receive_response(self, timeout_seconds, delay_seconds=5):
+        if self.ser and self.ser.is_open:
+            start_time = time.time()
+            while time.time() - start_time < timeout_seconds:
+                response = self.ser.readline().decode('utf-8').strip()
+                sanitized = self.sanitize_response(response)
+                if sanitized == "NOO" or not sanitized:
+                    time.sleep(delay_seconds)
+                    continue
+                self.log(f"Received: '{sanitized}'")
+                return sanitized
+            self.log(f"Timeout reached after {timeout_seconds} seconds.")
+            return None
+        else:
+            self.log("No active connection to receive response.")
+            return None
+
+class SerialGUI:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Serial Command GUI")
+        self.style = Style(theme="flatly")  # Using ttkbootstrap style
+        self.style.configure('TButton', font=('Arial', 12))
+
+        # Set the icon for the window (make sure the icon file is in the correct path)
+        try:
+            icon = PhotoImage(file="LabSoluZ-Logo.ico")  # Replace with your actual icon path
+            self.root.wm_iconphoto(True, icon)
+        except Exception as e:
+            print(f"Error loading icon: {e}")
+
+        self.driver = None
+        self.process_thread_obj = None
+        self.stop_event = threading.Event()
+
+        # Menu Bar
+        self.menu_bar = tk.Menu(root)
+        self.root.config(menu=self.menu_bar)
+
+        self.file_menu = tk.Menu(self.menu_bar, tearoff=0)
+        self.menu_bar.add_cascade(label="File", menu=self.file_menu)
+        self.file_menu.add_command(label="Exit", command=root.quit)
+
+        self.help_menu = tk.Menu(self.menu_bar, tearoff=0)
+        self.menu_bar.add_cascade(label="Help", menu=self.help_menu)
+        self.help_menu.add_command(label="About", command=self.show_about)
+
+        # COM Port selection
+        self.port_label = tk.Label(root, text="Select COM Port:")
+        self.port_label.pack(pady=(10, 0))
+
+        self.port_combo = ttk.Combobox(root, values=self.get_com_ports(), state="readonly")
+        self.port_combo.pack()
+        if self.port_combo["values"]:
+            self.port_combo.current(0)
+
+        # Start button
+        self.start_button = tk.Button(root, text="Start Process", command=self.start_process)
+        self.start_button.pack(pady=5)
+
+        # Stop button
+        self.stop_button = tk.Button(root, text="Stop Process", state=tk.DISABLED, command=self.stop_process)
+        self.stop_button.pack(pady=5)
+
+        # Checkbox for fixed number of cycles
+        self.fixed_cycles_var = tk.BooleanVar()
+        self.fixed_cycles_checkbox = tk.Checkbutton(root, text="Run for fixed number of cycles", variable=self.fixed_cycles_var, command=self.toggle_cycles_input)
+        self.fixed_cycles_checkbox.pack(pady=(5, 0))
+
+        # Number of cycles input
+        self.num_cycles_label = tk.Label(root, text="Number of cycles:")
+        self.num_cycles_entry = tk.Entry(root, state=tk.DISABLED)
+        self.num_cycles_label.pack(pady=5)
+        self.num_cycles_entry.pack(pady=(0, 10))
+
+        # Log output
+        self.output_box = scrolledtext.ScrolledText(root, width=100, height=30, state='disabled')
+        self.output_box.pack(padx=10, pady=10)
+
+        # Status Bar
+        self.status_bar = tk.Label(root, text="Ready", bd=1, relief="sunken", anchor="w", font=('Arial', 10))
+        self.status_bar.pack(side="bottom", fill="x")
+
+    def get_com_ports(self):
+        ports = serial.tools.list_ports.comports()
+        return [port.device for port in ports]
+
+    def log_to_gui(self, message):
+        self.output_box.configure(state='normal')
+        self.output_box.insert(tk.END, message + '\n')
+        self.output_box.see(tk.END)
+        self.output_box.configure(state='disabled')
+
+    def update_status(self, message):
+        self.status_bar.config(text=message)
+
+    def show_about(self):
+        messagebox.showinfo("About", "Serial Command GUI v1.0\n\nThis app allows you to send commands via serial communication and logs responses.")
+
+    def toggle_cycles_input(self):
+        if self.fixed_cycles_var.get():
+            self.num_cycles_entry.configure(state=tk.NORMAL)
+        else:
+            self.num_cycles_entry.configure(state=tk.DISABLED)
+
+    def start_process(self):
+        selected_port = self.port_combo.get()
+        self.stop_event.clear()
+
+        self.driver = SerialCommandDriver(log_callback=self.log_to_gui, port=selected_port)
+        self.driver.create_log_file()
+        self.driver.open_connection()
+
+        self.start_button.config(state=tk.DISABLED)
+        self.stop_button.config(state=tk.NORMAL)
+        self.update_status("Running...")
+
+        self.process_thread_obj = threading.Thread(target=self.process_thread)
+        self.process_thread_obj.start()
+
+    def stop_process(self):
+        self.stop_event.set()
+        self.stop_button.config(state=tk.DISABLED)
+        self.start_button.config(state=tk.NORMAL)
+        self.update_status("Stopped")
+
+        if self.driver:
+            try:
+                self.driver.close_connection()
+                self.driver.finalize_log()
+            except:
+                pass
+            
+
+    def process_thread(self):
+        while not self.stop_event.is_set():
+            # Check if the user wants a fixed number of cycles
+            if self.fixed_cycles_var.get():
+                num_cycles = int(self.num_cycles_entry.get())
+                if self.driver.cycle_counter >= num_cycles:
+                    self.stop_event.set()
+                    break
+
+            self.driver.cycle_counter += 1
+            self.driver.log(f"\n--- Starting cycle {self.driver.cycle_counter} ---\n")
+
+            self.driver.send_command("B\n")
+            response = self.driver.receive_response(timeout_seconds=60)
+
+            if self.stop_event.is_set():
+                break
+
+            if response == "BOK":
+                self.driver.log("Received 'BOK'. Now waiting for the next response...")
+                decap_response = self.driver.receive_response(timeout_seconds=120)
+
+                if decap_response == "DECAP_OK":
+                    self.driver.log("Received 'DECAP_OK'. Now sending 'C'...")
+                    self.driver.send_command("C\n")
+                    cok_response = self.driver.receive_response(timeout_seconds=60)
+
+                    if cok_response == "COK":
+                        recap_result = self.driver.receive_response(timeout_seconds=120)
+
+                        if recap_result == "RECAP_OK":
+                            self.driver.log("Received 'RECAP_OK'. Process complete.")
+                        elif recap_result in ["RECAP_ERR", "STATUS_WRONG_TUBE"]:
+                            self.driver.log(f"Error received: '{recap_result}'. Stopping the loop.")
+                            break
+                            self.stop_event.set()  # This is important, ensuring the loop terminates properly
+                        else:
+                            self.driver.log("Did not receive 'RECAP_OK'. Stopping the loop.")
+                            break
+                    else:
+                        self.driver.log("Did not receive 'COK'. Stopping the loop.")
+                        break
+
+                elif decap_response in ["STATUS_WRONG_TUBE", "DECAP_ERR"]:
+                    self.driver.log(f"Error received: '{decap_response}'. Stopping the loop.")
+                    break
+                else:
+                    self.driver.log("Did not receive 'DECAP_OK'. Stopping the loop.")
+                    break
+            elif response in ["STATUS_WRONG_TUBE", "BNO", "CNO"]:
+                self.driver.log(f"Error received: '{response}'. Stopping the loop.")
+                break
+            else:
+                self.driver.log("Did not receive 'BOK' within the expected time. Stopping the loop.")
+                break
+
+            time.sleep(1)
+
+        self.driver.finalize_log()
+        self.driver.close_connection()
+        self.stop_button.config(state=tk.DISABLED)
+        self.start_button.config(state=tk.NORMAL)
+        self.update_status("Completed")  # Update the status bar to "Completed"
+
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = SerialGUI(root)
+    root.mainloop()

@@ -1,4 +1,5 @@
-# version2.1
+# version2.2
+#Note: added wait_for_recap() for "STATUS_WRONG_TUBE" during recap retry. 
 #pyinstaller --onefile --noconsole --add-data "logo.png;." GUI.py
 import tkinter as tk
 from tkinter import ttk, scrolledtext, messagebox
@@ -165,9 +166,9 @@ class SerialGUI:
         self.status_bar.config(text=message)
     def show_about(self):
         messagebox.showinfo( "About",
-        "Serial Command v2.1\n\n"
+        "Serial Command v2.2\n\n"
         "Developed by Siddharth Singh Chauhan\n\n"
-        "This app allows you to send commands via serial communication and logs responses. \n\n This version ignores 'STATUS_WRONG_TUBE'. Added option to add delay")
+        "This app allows you to send commands via serial communication and logs responses. \n\nThis version ignores 'STATUS_WRONG_TUBE'. Added option to add delay. STATUS_WRONG_TUBE ignored after recap retry with 30 seconds acceptance limit.")
 
     def toggle_cycles_input(self):
         if self.fixed_cycles_var.get():
@@ -221,15 +222,22 @@ class SerialGUI:
                 return None
 
     def wait_for_recap(self):
+        cok_time = time.time()  # Time when we start waiting after receiving 'COK'
+
         while True:
             response = self.driver.receive_response(timeout_seconds=300)
+            elapsed = time.time() - cok_time
+
             if response == "STATUS_WRONG_TUBE":
-                self.driver.log("STATUS_WRONG_TUBE received. Retrying RECAP...")
-                self.driver.send_command("C\n")
+                if elapsed < 30:
+                    self.driver.log("STATUS_WRONG_TUBE received within 30s. Retrying RECAP...")
+                    self.driver.send_command("C\n")
+                else:
+                    self.driver.log("STATUS_WRONG_TUBE received after 30s. Ignoring...")
                 continue
             elif response == "COK":
                 self.driver.log("Received 'COK'. Waiting for RECAP_OK or RECAP_ERR...")
-                # After receiving COK, continue loop to wait for final response
+                cok_time = time.time()  # Reset time on new COK
                 continue
             elif response in ["RECAP_OK", "RECAP_ERR"]:
                 return response
